@@ -1,5 +1,13 @@
-# -*- coding: utf-8 -*-
-"""RWAP Task 2 Analytical Dashboard"""
+# -- coding: utf-8 --
+"""RWAP Task 2 – Analytical Dashboard (cleaned)
+
+Features
+- Loads CSV and JSON value mappings directly from Google Drive (or any HTTPS URL)
+- Falls back to file uploaders if URLs are empty or fail
+- Automatically inverts label->code maps to code->label, and aliases *_d1 columns (e.g., State_d1)
+- Shows decoded, human-readable values in filters, tables, and charts
+- Keeps original analytics: KPIs, time series, map, spatial analysis, segment summaries, downloads
+"""
 
 import os
 import re
@@ -7,6 +15,9 @@ import io
 import math
 import json
 import joblib
+import tempfile
+import requests
+import gdown
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -32,7 +43,7 @@ def load_csv(file_bytes_or_path):
     else:
         return pd.read_csv(file_bytes_or_path, low_memory=False)
 
-def detect_date_cols(df):
+def detect_date_cols(df: pd.DataFrame):
     pat = re.compile(r"^\d{2}-\d{2}-\d{4}$")
     date_cols = [c for c in df.columns if pat.match(str(c))]
     date_cols_sorted = sorted(date_cols, key=lambda x: pd.to_datetime(x, dayfirst=True))
@@ -78,65 +89,154 @@ def format_money(x):
         return "—"
 
 # --------------------------
+# URL download + mapping helpers
+# --------------------------
+@st.cache_data(show_spinner=False)
+def _is_drive_link(url: str) -> bool:
+    return ("drive.google.com" in url) or ("docs.google.com/uc" in url)
+
+def _extract_drive_id(url: str):
+    patterns = [
+        r"drive\.google\.com\/file\/d\/([^\/\?]+)",  # /file/d/<id>/view
+        r"[?&]id=([^&]+)"                               # ...?id=<id>
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+@st.cache_data(show_spinner=True)
+def download_to_temp(url: str) -> str:
+    """Download a CSV or JSON from Google Drive or an HTTPS URL to a temp path and return that path."""
+    if not url:
+        raise ValueError("Empty URL.")
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.close()
+    out_path = tmp.name
+
+    if _is_drive_link(url):
+        file_id = _extract_drive_id(url)
+        if not file_id:
+            raise ValueError("Could not extract Google Drive file id from the URL.")
+        gdown.download(id=file_id, output=out_path, quiet=False)
+    else:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+
+    return out_path
+
+@st.cache_data(show_spinner=False)
+def load_csv_from_url(url: str) -> pd.DataFrame:
+    path = download_to_temp(url)
+    return pd.read_csv(path, low_memory=False)
+
+@st.cache_data(show_spinner=False)
+def load_mapping_from_url(url: str) -> dict:
+    path = download_to_temp(url)
+    with open(path, "r", encoding="utf-8") as f:
+        raw_map = json.load(f)
+    # Invert label->code => code->label, and also alias *_d1 variants (e.g., State_d1)
+    mappings = {}
+    for col, mapping in raw_map.items():
+        inverted = {str(code): label for label, code in mapping.items()}
+        mappings[col] = inverted
+        mappings[col + "_d1"] = inverted
+    return mappings
+
+def decode_columns(df: pd.DataFrame, mappings: dict) -> pd.DataFrame:
+    df_decoded = df.copy()
+    for col, mapping in mappings.items():
+        if col in df_decoded.columns:
+            df_decoded[col] = df_decoded[col].astype(str).map(lambda x: mapping.get(x, x))
+    return df_decoded
+
+# --------------------------
 # Sidebar – Data & Model
 # --------------------------
 st.sidebar.header("Data & Model")
 
 sample_data_note = (
     "Tip: Use the enriched file from Task 1 (e.g., "
-    "`task1_valuations_timeaware.csv` or `task1_valuations_with_preds.csv`)."
+    "task1_valuations_timeaware.csv or task1_valuations_with_preds.csv)."
 )
 st.sidebar.info(sample_data_note)
 
-# File upload
+# --- URL inputs (prefilled with your Drive links; you can change them in the UI) ---
+csv_url = st.sidebar.text_input(
+    "Dataset URL (CSV)",
+    value="https://drive.google.com/file/d/1PQhDafw41pe3DAcV6Cf5eakstuyDiZU7/view?usp=sharing",
+    help="Paste a Google Drive link (shared to 'Anyone with the link') or any direct HTTPS URL."
+)
+
+json_url = st.sidebar.text_input(
+    "Value mapping URL (JSON)",
+    value="https://drive.google.com/file/d/1BMjYb-Nj9UtijzyuZq41_vHz_T1VR0bN/view?usp=sharing",
+    help="Paste a Google Drive link (shared to 'Anyone with the link') or any direct HTTPS URL."
+)
+
+# Load from URL (no upload needed)
 df = None
-up = st.sidebar.file_uploader("Upload dataset (.csv)", type=["csv"])
-if up is not None:
-    df = pd.read_csv(up, low_memory=False)
-
-# --------------------------
-# Apply JSON mapping to decode encoded columns
-# --------------------------
-json_file = st.sidebar.file_uploader("Upload combined JSON mapping (.json)", type=["json"])
 mappings = {}
-if json_file is not None:
-    raw_map = json.load(io.TextIOWrapper(json_file, encoding="utf-8"))
-    # Invert mapping: code -> label
-    mappings = {}
-    for col, mapping in raw_map.items():
-        inverted = {str(code): label for label, code in mapping.items()}
-        mappings[col] = inverted
-        # Also handle suffixed columns like "State_d1"
-        mappings[col + "_d1"] = inverted
 
+if csv_url.strip():
+    try:
+        df = load_csv_from_url(csv_url.strip())
+        st.sidebar.success("CSV loaded from URL")
+    except Exception as e:
+        st.sidebar.error(f"Failed to load CSV from URL: {e}")
 
+if json_url.strip():
+    try:
+        mappings = load_mapping_from_url(json_url.strip())
+        st.sidebar.success("Mapping loaded from URL")
+    except Exception as e:
+        st.sidebar.error(f"Failed to load JSON mapping from URL: {e}")
 
+# (Optional) Fallback uploaders – comment out if you truly never want uploads
+if df is None:
+    up = st.sidebar.file_uploader("…or upload dataset (.csv)", type=["csv"])
+    if up is not None:
+        df = pd.read_csv(up, low_memory=False)
+        st.sidebar.success("CSV loaded from upload")
 
+if not mappings:
+    json_file = st.sidebar.file_uploader("…or upload combined JSON mapping (.json)", type=["json"])
+    if json_file is not None:
+        raw_map = json.load(io.TextIOWrapper(json_file, encoding="utf-8"))
+        mappings = {}
+        for col, mapping in raw_map.items():
+            inverted = {str(code): label for label, code in mapping.items()}
+            mappings[col] = inverted
+            mappings[col + "_d1"] = inverted
+        st.sidebar.success("Mapping loaded from upload")
 
-def decode_columns(df, mappings):
-    df_decoded = df.copy()
-    for col, mapping in mappings.items():
-        if col in df_decoded.columns:
-            # Convert everything to string for safe mapping
-            df_decoded[col] = df_decoded[col].astype(str).map(lambda x: mapping.get(x, x))
-    return df_decoded
+# Apply decoding and preview
+if df is None:
+    st.warning("Provide a Dataset URL (or upload a CSV) to begin.")
+    st.stop()
 
-df = decode_columns(df, mappings)
-
-if df is not None and json_file is not None:
+if mappings:
     df = decode_columns(df, mappings)
     st.write("Decoded columns preview:")
     st.dataframe(df.head(10))
 
-
+# --------------------------
 # Model loader (optional)
+# --------------------------
 st.sidebar.subheader("Valuation Model (optional)")
 model_path = st.sidebar.text_input("CatBoost model path (.cbm or .joblib)", value="asset_valuation_model.cbm")
 loaded_model = None
 catboost_loaded = False
-cat_cols_for_model = ["Owned or Leased","GSA Region","State_d1","City_d1",
-                      "Real Property Asset Type","Building Status","Metro","CountyName"]
-num_cols_for_model = ["Building Rentable Square Feet","Building Age","Latitude","Longitude","valuation_per_sqft"]
+cat_cols_for_model = [
+    "Owned or Leased","GSA Region","State_d1","City_d1",
+    "Real Property Asset Type","Building Status","Metro","CountyName"
+]
+num_cols_for_model = [
+    "Building Rentable Square Feet","Building Age","Latitude","Longitude","valuation_per_sqft"
+]
 
 if model_path and os.path.exists(model_path):
     try:
@@ -159,10 +259,6 @@ if model_path and os.path.exists(model_path):
 st.title("RWAP 2025–26 — Task 2 Analytical Dashboard")
 st.caption("Descriptive & Inferential stats • Time-series explorer • Mapping & Spatial analysis")
 
-if df is None:
-    st.warning("Upload or load a CSV to begin.")
-    st.stop()
-
 # Basic hygiene
 date_cols_sorted = detect_date_cols(df)
 has_geo = ("Latitude" in df.columns) and ("Longitude" in df.columns)
@@ -181,25 +277,43 @@ chosen_val_col = st.selectbox("Valuation column to analyze", val_options or df.c
 with st.expander("Filters", expanded=True):
     cols_left, cols_right = st.columns(2)
     with cols_left:
-        state_sel = st.multiselect("State", sorted(df["State_d1"].dropna().astype(str).unique()) if "State_d1" in df.columns else [])
-        city_sel  = st.multiselect("City",  sorted(df["City_d1"].dropna().astype(str).unique()) if "City_d1" in df.columns else [])
-        type_sel  = st.multiselect("Asset Type (code)", sorted(df["Real Property Asset Type"].dropna().unique()) if "Real Property Asset Type" in df.columns else [])
+        state_sel = st.multiselect(
+            "State",
+            sorted(df["State_d1"].dropna().astype(str).unique()) if "State_d1" in df.columns else []
+        )
+        city_sel  = st.multiselect(
+            "City",
+            sorted(df["City_d1"].dropna().astype(str).unique()) if "City_d1" in df.columns else []
+        )
+        type_sel  = st.multiselect(
+            "Asset Type",
+            sorted(df["Real Property Asset Type"].dropna().astype(str).unique()) if "Real Property Asset Type" in df.columns else []
+        )
     with cols_right:
-        own_sel   = st.multiselect("Owned or Leased", sorted(df["Owned or Leased"].dropna().astype(str).unique()) if "Owned or Leased" in df.columns else [])
-        status_sel= st.multiselect("Building Status", sorted(df["Building Status"].dropna().astype(str).unique()) if "Building Status" in df.columns else [])
-        zip_sel   = st.multiselect("Zip Code", sorted(df["Zip Code"].dropna().astype(str).unique()) if "Zip Code" in df.columns else [])
+        own_sel   = st.multiselect(
+            "Owned or Leased",
+            sorted(df["Owned or Leased"].dropna().astype(str).unique()) if "Owned or Leased" in df.columns else []
+        )
+        status_sel= st.multiselect(
+            "Building Status",
+            sorted(df["Building Status"].dropna().astype(str).unique()) if "Building Status" in df.columns else []
+        )
+        zip_sel   = st.multiselect(
+            "Zip Code",
+            sorted(df["Zip Code"].dropna().astype(str).unique()) if "Zip Code" in df.columns else []
+        )
 
 # Apply filters
 mask = pd.Series(True, index=df.index)
 if state_sel and "State_d1" in df.columns:  mask &= df["State_d1"].astype(str).isin(state_sel)
 if city_sel  and "City_d1" in df.columns:   mask &= df["City_d1"].astype(str).isin(city_sel)
-if type_sel  and "Real Property Asset Type" in df.columns: mask &= df["Real Property Asset Type"].isin(type_sel)
+if type_sel  and "Real Property Asset Type" in df.columns: mask &= df["Real Property Asset Type"].astype(str).isin(type_sel)
 if own_sel   and "Owned or Leased" in df.columns: mask &= df["Owned or Leased"].astype(str).isin(own_sel)
 if status_sel and "Building Status" in df.columns: mask &= df["Building Status"].astype(str).isin(status_sel)
 if zip_sel and "Zip Code" in df.columns: mask &= df["Zip Code"].astype(str).isin(zip_sel)
 
 dff = df[mask].copy()
-st.write(f"**Filtered rows:** {len(dff):,} of {len(df):,}")
+st.write(f"*Filtered rows:* {len(dff):,} of {len(df):,}")
 
 # --------------------------
 # KPIs
@@ -224,17 +338,25 @@ with tab1:
     c1, c2 = st.columns([2,1])
     with c1:
         st.subheader("Distribution of valuation")
-        st.bar_chart(dff[chosen_val_col].dropna().clip(upper=dff[chosen_val_col].quantile(0.99)))
+        if chosen_val_col in dff:
+            st.bar_chart(dff[chosen_val_col].dropna().clip(upper=dff[chosen_val_col].quantile(0.99)))
+        else:
+            st.info("Selected valuation column not found in data.")
     with c2:
         st.subheader("By Asset Type (median)")
-        if "Real Property Asset Type" in dff.columns:
+        if "Real Property Asset Type" in dff.columns and chosen_val_col in dff.columns:
             by_type = dff.groupby("Real Property Asset Type")[chosen_val_col].median().sort_values(ascending=False)
             st.dataframe(by_type.reset_index().rename(columns={chosen_val_col:"Median Valuation"}))
         else:
-            st.info("Column `Real Property Asset Type` not found.")
+            st.info("Column(s) missing for this view.")
     st.subheader("Top 15 assets by valuation")
-    show_cols = [c for c in ["Street Address","City_d1","State_d1","Zip Code","Real Property Asset Type", chosen_val_col] if c in dff.columns]
-    st.dataframe(dff.nlargest(15, chosen_val_col)[show_cols])
+    show_cols = [c for c in [
+        "Street Address","City_d1","State_d1","Zip Code","Real Property Asset Type", chosen_val_col
+    ] if c in dff.columns]
+    if chosen_val_col in dff.columns:
+        st.dataframe(dff.nlargest(15, chosen_val_col)[show_cols])
+    else:
+        st.info("Selected valuation column not found.")
 
 # ---- Time series explorer
 with tab2:
@@ -259,11 +381,15 @@ with tab2:
 # ---- Map (GIS)
 with tab3:
     st.subheader("Geospatial view")
-    if has_geo:
+    if has_geo and chosen_val_col in dff.columns:
         sample_n = st.slider("Sample points (for performance)", 1000, 10000, 3000, step=500)
-        dmap = dff[["Latitude","Longitude", chosen_val_col]].dropna().sample(min(sample_n, len(dff)), random_state=42)
-        st.map(dmap.rename(columns={"Latitude":"lat","Longitude":"lon"}))
-        st.caption("Tip: Zoom and pan. Color scale is uniform; use filters to focus.")
+        dmap = dff[["Latitude","Longitude", chosen_val_col]].dropna()
+        if len(dmap) > 0:
+            dmap = dmap.sample(min(sample_n, len(dmap)), random_state=42)
+            st.map(dmap.rename(columns={"Latitude":"lat","Longitude":"lon"}))
+            st.caption("Tip: Zoom and pan. Color scale is uniform; use filters to focus.")
+        else:
+            st.info("No geocoded rows after filtering.")
     else:
         st.info("No Latitude/Longitude columns; cannot render map.")
 
@@ -274,7 +400,7 @@ with tab4:
         st.info("No coordinates available.")
     else:
         if not PYSAL_AVAILABLE:
-            st.warning("Install `esda` and `libpysal` to enable Moran's I:  \n`pip install esda libpysal`")
+            st.warning("Install esda and libpysal to enable Moran's I:  \n`pip install esda libpysal`")
         else:
             k = st.slider("KNN neighbors (k)", 4, 20, 8)
             I, p = compute_moran_i(dff, chosen_val_col, "Latitude", "Longitude", k=k)
@@ -289,12 +415,12 @@ with tab4:
 with tab5:
     st.subheader("Segment summaries")
     seg1, seg2 = st.columns(2)
-    if "State_d1" in dff.columns:
+    if "State_d1" in dff.columns and chosen_val_col in dff.columns:
         with seg1:
             st.write("By State (median)")
             s1 = dff.groupby("State_d1")[chosen_val_col].median().sort_values(ascending=False).head(20)
             st.dataframe(s1.reset_index().rename(columns={chosen_val_col:"Median valuation"}))
-    if "City_d1" in dff.columns:
+    if "City_d1" in dff.columns and chosen_val_col in dff.columns:
         with seg2:
             st.write("By City (median)")
             s2 = dff.groupby("City_d1")[chosen_val_col].median().sort_values(ascending=False).head(20)
