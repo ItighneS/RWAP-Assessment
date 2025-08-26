@@ -147,6 +147,8 @@ def load_mapping_from_url(url: str) -> dict:
     return mappings
 
 def decode_columns(df: pd.DataFrame, mappings: dict) -> pd.DataFrame:
+    if df is None:
+        raise ValueError("decode_columns called with df=None")
     df_decoded = df.copy()
     for col, mapping in mappings.items():
         if col in df_decoded.columns:
@@ -181,10 +183,12 @@ json_url = st.sidebar.text_input(
 df = None
 mappings = {}
 
+csv_loaded_from_url = False
 if csv_url.strip():
     try:
         df = load_csv_from_url(csv_url.strip())
         st.sidebar.success("CSV loaded from URL")
+        csv_loaded_from_url = True
     except Exception as e:
         st.sidebar.error(f"Failed to load CSV from URL: {e}")
 
@@ -195,9 +199,27 @@ if json_url.strip():
     except Exception as e:
         st.sidebar.error(f"Failed to load JSON mapping from URL: {e}")
 
-# --- Apply decoding safely ---
+# (Optional) Fallback uploaders – comment out if you truly never want uploads
 if df is None:
-    st.warning("No dataset loaded yet. Provide a Dataset URL or upload a CSV.")
+    up = st.sidebar.file_uploader("…or upload dataset (.csv)", type=["csv"])
+    if up is not None:
+        df = pd.read_csv(up, low_memory=False)
+        st.sidebar.success("CSV loaded from upload")
+
+if not mappings:
+    json_file = st.sidebar.file_uploader("…or upload combined JSON mapping (.json)", type=["json"])
+    if json_file is not None:
+        raw_map = json.load(io.TextIOWrapper(json_file, encoding="utf-8"))
+        mappings = {}
+        for col, mapping in raw_map.items():
+            inverted = {str(code): label for label, code in mapping.items()}
+            mappings[col] = inverted
+            mappings[col + "_d1"] = inverted
+        st.sidebar.success("Mapping loaded from upload")
+
+# Apply decoding and preview (GUARDED)
+if df is None:
+    st.warning("Provide a Dataset URL (or upload a CSV) to begin.")
     st.stop()
 
 if mappings:
@@ -209,16 +231,6 @@ if mappings:
         st.error(f"Failed to apply value mapping: {e}")
 else:
     st.info("No mapping provided yet — encoded values may appear.")
-
-# Apply decoding and preview
-if df is None:
-    st.warning("Provide a Dataset URL (or upload a CSV) to begin.")
-    st.stop()
-
-if mappings:
-    df = decode_columns(df, mappings)
-    st.write("Decoded columns preview:")
-    st.dataframe(df.head(10))
 
 # --------------------------
 # Model loader (optional)
@@ -310,7 +322,7 @@ if status_sel and "Building Status" in df.columns: mask &= df["Building Status"]
 if zip_sel and "Zip Code" in df.columns: mask &= df["Zip Code"].astype(str).isin(zip_sel)
 
 dff = df[mask].copy()
-st.write(f"*Filtered rows:* {len(dff):,} of {len(df):,}")
+st.write(f"Filtered rows: {len(dff):,} of {len(df):,}")
 
 # --------------------------
 # KPIs
