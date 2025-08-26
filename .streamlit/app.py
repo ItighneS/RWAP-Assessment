@@ -195,23 +195,20 @@ if json_url.strip():
     except Exception as e:
         st.sidebar.error(f"Failed to load JSON mapping from URL: {e}")
 
-# (Optional) Fallback uploaders – comment out if you truly never want uploads
+# --- Apply decoding safely ---
 if df is None:
-    up = st.sidebar.file_uploader("…or upload dataset (.csv)", type=["csv"])
-    if up is not None:
-        df = pd.read_csv(up, low_memory=False)
-        st.sidebar.success("CSV loaded from upload")
+    st.warning("No dataset loaded yet. Provide a Dataset URL or upload a CSV.")
+    st.stop()
 
-if not mappings:
-    json_file = st.sidebar.file_uploader("…or upload combined JSON mapping (.json)", type=["json"])
-    if json_file is not None:
-        raw_map = json.load(io.TextIOWrapper(json_file, encoding="utf-8"))
-        mappings = {}
-        for col, mapping in raw_map.items():
-            inverted = {str(code): label for label, code in mapping.items()}
-            mappings[col] = inverted
-            mappings[col + "_d1"] = inverted
-        st.sidebar.success("Mapping loaded from upload")
+if mappings:
+    try:
+        df = decode_columns(df, mappings)
+        st.write("Decoded columns preview:")
+        st.dataframe(df.head(10))
+    except Exception as e:
+        st.error(f"Failed to apply value mapping: {e}")
+else:
+    st.info("No mapping provided yet — encoded values may appear.")
 
 # Apply decoding and preview
 if df is None:
